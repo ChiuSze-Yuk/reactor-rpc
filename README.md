@@ -4,6 +4,8 @@
 消息以 `\n` 分帧，协议为 JSON-RPC 2.0 子集。不使用 muduo / Boost.Asio 等网络框架，
 仅依赖 C++11 标准库与 header-only 的 `nlohmann/json`（服务端为单文件实现）。
 
+[![build-and-test](https://github.com/jacobSze-Yukchiu/reactor-rpc/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/jacobSze-Yukchiu/reactor-rpc/actions/workflows/build-and-test.yml)
+
 ```text
 主线程（Reactor）
   epoll_wait

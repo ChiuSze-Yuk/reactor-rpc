@@ -1,0 +1,4 @@
+mode=pipeline connections=64 requests/conn=200 requested=12800
+completed=12800 errors=0 wall=0.152s throughput=84470.4 req/s
+latency p50=35.508ms p95=62.657ms max=64.442ms
+PASS

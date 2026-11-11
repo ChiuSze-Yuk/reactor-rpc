@@ -1,7 +1,10 @@
-# C++ 简易 RPC 服务端
+# 轻量级 C++ RPC 服务端（epoll ET + 线程池）
 
-update: 将“单线程处理完一个连接再处理下一个”的处理模式改为
-**epoll(ET) + 线程池的 Reactor 模型**：
+单进程 TCP RPC 服务端：epoll 边缘触发（ET）+ 固定大小线程池的 Reactor 模型，
+消息以 `\n` 分帧，协议为 JSON-RPC 2.0 子集。不使用 muduo / Boost.Asio 等网络框架，
+仅依赖 C++11 标准库与 header-only 的 `nlohmann/json`（服务端为单文件实现）。
+
+[![build-and-test](https://github.com/jacobSze-Yukchiu/reactor-rpc/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/jacobSze-Yukchiu/reactor-rpc/actions/workflows/build-and-test.yml)
 
 ```text
 主线程（Reactor）
@@ -91,7 +94,6 @@ g++ -std=c++11 -O2 -Wall -Wextra -pedantic -I. \
 
 `-pthread` 不能省略：`std::thread`、`std::mutex`、`std::condition_variable`
 都需要它。macOS / Windows 没有 `sys/epoll.h`，请在 Linux、WSL 或 Docker 中编译运行。
-仓库中既有的 `rpc_server` 二进制可能是旧版或其他平台的产物，请以上面的命令重新编译为准。
 
 ## 5. 运行
 
@@ -209,25 +211,49 @@ top -H -p "$(pgrep -n rpc_server)"     # 查看 worker CPU 使用
 ss -ltnp | grep 8080                   # 查看监听与连接（Linux）
 ```
 
-## 7. 设计取舍与目前限制
+## 7. 性能实测
+
+测试环境：2 核 / 2 GiB Linux 云服务器，服务端与压测客户端同机运行；客户端为
+`bench_client.py` 的 Python 多线程实现，受 GIL 限制，因此下表的数字更能说明
+“服务端不成为瓶颈”，而不是服务端的吞吐上限。
+
+| 场景 | 请求数 | 耗时 | 吞吐 | p50 | p95 | max | 错误 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| keep-alive（64 连接 × 200） | 12,800 | 1.100 s | 11,641.7 req/s | 4.206 ms | 13.098 ms | 41.277 ms | 0 |
+| pipeline（64 连接 × 200） | 12,800 | 0.152 s | 84,470.4 req/s | 35.508 ms | 62.657 ms | 64.442 ms | 0 |
+
+原始输出见 `keep_alive_report.txt`、`pipeline_report.txt`；协议边界与防御测试的
+原始输出见 `wire_test_report.txt`（9/9 PASS）。
+
+怎么读这两行数字：
+
+- **pipeline 的 84,470.4 req/s 不等于“单个请求更快”**：一次 `sendall` 把 200 个请求
+  一起推给内核，省掉了 12,800 次网络往返，代价是同一条连接内的响应排队——
+  p50 从 4.2 ms 涨到 35.5 ms。
+- 两种模式下客户端都逐条校验响应的 `id` 与 `result`，`errors=0` 说明没有串线、
+  丢包或顺序错乱，而不只是“看起来快”。
+- 换机器、换 worker 数量、换客户端实现都会改变这些数字；仓库里的报告文件是
+  同一台机器、同一次运行的原始输出。
+
+## 8. 设计取舍与目前限制
 
 1. **worker 内的 `send` 可能等待**：发送缓冲区满时会 `poll(POLLOUT)` 最多 1 秒。
    少数“只连接不读响应”的慢客户端可能暂时占住 worker。
    生产级实现通常改成每连接输出队列 + `EPOLLOUT`，让 worker 立即返回。
 2. **没有空闲连接超时**：恶意客户端可以建立大量空连接。可加入 last-active 时间
    与定时清扫。
-3. **没有 TLS / 认证 / 限流**：目前只适合内网教学与压测。
+3. **没有 TLS / 认证 / 限流**：目前定位为单机自用与压测，不适合直接暴露公网。
 4. **单条连接的批量上限**：一次事件中若缓冲区有很多完整消息，会由同一个 worker
    连续处理；这保证顺序，但可能让该 worker 在这批消息期间忙碌。
-5. **没有优雅停机**：目前用 `Ctrl+C` / `kill` 结束；可加入 signal handler，
-   停止 epoll 循环、停止接收新连接，再等待线程池排空。
+5. **停机是“排空式”的**：收到 `SIGINT` / `SIGTERM` 后先停止 epoll 循环、不再接收新连接，
+   线程池把队列里剩余任务跑完再 `join`；队列积压较多时退出需要等一会儿，且不会通知客户端。
 6. **任务队列没有上限**：极端流量下若 worker 跟不上，主线程分发的任务会持续堆积；
    生产环境应加入队列长度上限或背压策略。
 7. **超限关闭是尽力而为**：送出 `-32600` 后会有限量 drain 已到达的输入数据，
    降低 close 时因未读数据触发 RST 而丢失错误响应的概率；若客户端持续灌数据，
    仍可能在 close 时收到 RST。
 
-## 8. 常见问题
+## 9. 常见问题
 
 **`sys/epoll.h: No such file or directory`**
 
@@ -247,7 +273,7 @@ lsof -nP -iTCP:8080 -sTCP:LISTEN
 
 **客户端一直等不到响应**
 
-- 请求必须以 `\n` 结尾，且上网线要用 `dump()`，不能用 `dump(4)`。
+- 请求必须以 `\n` 结尾，且发送时要用 `dump()`，不能用 `dump(4)`。
 - 检查服务端是否打印 `-32700` / `-32600`。
 - 若每连接接收缓冲超过 1 MiB，服务端会回 `-32600` 并关闭连接；可用 `wire_test.py` 验证。
 
@@ -255,10 +281,15 @@ lsof -nP -iTCP:8080 -sTCP:LISTEN
 
 编译命令漏了 `-pthread`。
 
-## 9. 下一步可扩展方向
+## 10. 下一步可扩展方向
 
 1. 每连接输出缓冲区 + `EPOLLOUT`，彻底避免 worker 等待慢客户端。
 2. 空闲连接超时与心跳。
-3. `SIGINT` / `SIGTERM` 优雅停机。
+3. 请求级超时与取消：给长耗时业务设置 deadline。
 4. 请求计数、延迟直方图、当前连接数等 metrics。
 5. TLS、认证、按 IP 限流。
+
+---
+
+> **开发说明**：本项目自 2026-09 起在本地迭代，2026-11 整理后上传到 GitHub；
+> 压测报告为整理前的原始输出，未做任何修饰。

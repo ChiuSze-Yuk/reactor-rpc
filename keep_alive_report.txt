@@ -1,0 +1,4 @@
+mode=keep-alive connections=64 requests/conn=200 requested=12800
+completed=12800 errors=0 wall=1.100s throughput=11641.7 req/s
+latency p50=4.206ms p95=13.098ms max=41.277ms
+PASS

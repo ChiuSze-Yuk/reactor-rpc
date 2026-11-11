@@ -1,0 +1,10 @@
+PASS  basic math.add
+PASS  JSON parse error -32700
+PASS  unknown method -32601
+PASS  invalid params count -32602
+PASS  invalid params type -32602
+PASS  partial packet
+PASS  sticky packets
+PASS  half close
+PASS  oversize > 1 MiB
+9/9 tests passed

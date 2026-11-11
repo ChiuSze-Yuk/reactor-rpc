@@ -1,7 +1,7 @@
 // =============================================================================
 // rpc_client.cpp
 //
-// 第一阶段 RPC 客户端：
+// RPC 客户端：
 //   1. 连接到 127.0.0.1:8080（也可通过命令行参数指定 host 和 port）。
 //   2. 建立一个测试用 RPC 请求 JSON。
 //   3. 以“紧凑 JSON + '\n'”的形式发送给服务端。
@@ -149,9 +149,9 @@ json make_test_request() {
     request["method"] = "math.add";   // 想调用的远程方法
     request["params"] = json::array({12, 30});  // 参数列表
 
-    // meta 是选填的附加信息；本阶段只用来帮助观察与调试。
+    // meta 是选填的附加信息；这里仅用于帮助观察与调试。
     request["meta"]["client"] = "rpc_client.cpp";
-    request["meta"]["note"] = "Step 1 test request";
+    request["meta"]["note"] = "basic test request";
 
     return request;
 }

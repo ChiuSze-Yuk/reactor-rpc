@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""第三阶段 RPC 服务端压测工具。
+"""RPC 服务端压测工具。
 
 用法：
     python3 bench_client.py                          # 32 连接 x 100 次 keep-alive 请求

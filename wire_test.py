@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Protocol boundary tests for the stage-3 RPC server.
+"""Protocol boundary tests for the RPC server.
 
 Usage:
     ./rpc_server 4

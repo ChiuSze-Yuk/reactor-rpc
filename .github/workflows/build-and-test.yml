@@ -1,0 +1,40 @@
+name: build-and-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          g++ -std=c++11 -O2 -Wall -Wextra -pedantic -I. rpc_server.cpp -o rpc_server -pthread
+          g++ -std=c++11 -O2 -Wall -Wextra -pedantic -I. rpc_client.cpp -o rpc_client
+
+      - name: Start server
+        run: |
+          ./rpc_server 4 > /tmp/server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if python3 -c "import socket,sys; sys.exit(0 if socket.socket().connect_ex(('127.0.0.1', 8080)) == 0 else 1)"; then
+              echo "server is up"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "server failed to start"; cat /tmp/server.log; exit 1
+
+      - name: Protocol boundary tests
+        run: python3 wire_test.py
+
+      - name: Benchmark smoke test
+        run: |
+          python3 bench_client.py -c 8 -n 20
+          python3 bench_client.py -c 8 -n 20 --pipeline
+
+      - name: Server log
+        if: always()
+        run: tail -n 40 /tmp/server.log

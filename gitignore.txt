@@ -1,0 +1,22 @@
+# 编译产物
+rpc_server
+rpc_client
+*.o
+*.out
+a.out
+build/
+
+# 编辑器配置
+.vscode/
+.idea/
+*.swp
+
+# 系统文件 (macOS)
+.DS_Store
+
+# 日志文件
+*.log
+
+# 临时测试文件
+__pycache__/
+*.pyc

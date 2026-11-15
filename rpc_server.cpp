@@ -85,8 +85,7 @@ const int kListenBacklog = 512;
 // 每次 recv 使用的缓冲区大小。
 const std::size_t kReadBufferSize = 4096;
 
-// 发送遇到 EAGAIN 时，最多等待可写的时间（毫秒）。
-const int kSendTimeoutMs = 1000;
+// 发送遇到 EAGAIN 时的策略说明见 RpcServer::send_json / flush_output。
 
 // 工作线程数量上限，避免命令行参数过大耗尽系统资源。
 const std::size_t kMaxWorkerThreads = 256;
@@ -158,50 +157,15 @@ bool set_nonblocking(int fd) {
     return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-// 非阻塞版本的 send_all。
+// 发送策略：每连接输出队列 + EPOLLOUT（非阻塞，绝不阻塞 worker）。
 //
-// 这里的 socket 是 O_NONBLOCK：
-//   - send 可能只送出一部分，所以要循环；
-//   - 内核发送缓冲区满时 send 会返回 EAGAIN/EWOULDBLOCK，
-//     此时用 poll(POLLOUT) 等一小段时间再重试，避免直接丢弃响应。
+// 旧实现会在 send 遇到 EAGAIN 时用 poll(POLLOUT) 等最多 1 秒，
+// 少数“只连接、不读响应”的慢客户端会因此长期占住一个 worker；
+// 几十个这样的连接就能把固定线程池饿死，而服务端进程看起来仍然存活。
 //
-// 这个函数只会被 worker 线程调用，所以即使 poll 等待也不会卡住 Reactor。
-bool send_all_nonblocking(int fd, const std::string& data) {
-    std::size_t sent = 0;
-
-    while (sent < data.size()) {
-        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
-
-        if (n > 0) {
-            sent += static_cast<std::size_t>(n);
-            continue;
-        }
-
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            pollfd pfd;
-            pfd.fd = fd;
-            pfd.events = POLLOUT;
-            pfd.revents = 0;
-
-            const int ready = ::poll(&pfd, 1, kSendTimeoutMs);
-            if (ready > 0) {
-                continue;  // 可写了，重试 send
-            }
-            if (ready < 0 && errno == EINTR) {
-                continue;
-            }
-            return false;  // 超时或 poll 出错
-        }
-
-        return false;  // EPIPE / ECONNRESET 等
-    }
-
-    return true;
-}
+// 新实现改为：send 发不出去时，把剩余字节放进 Connection::output_buffer，
+// 注册 EPOLLOUT，worker 立即返回；等内核发送缓冲区可写时，事件循环再触发
+// flush_output 继续发送。worker 的占用时间因此与慢连接解耦。
 
 // 每条客户端连接的应用层状态。
 //
@@ -218,6 +182,11 @@ struct Connection {
     // 避免 fd 关闭后被新连接重用时，旧事件误作用到新连接。
     std::uint64_t id;
     std::string input_buffer;  // 应用层接收缓冲区（解决粘包/半包）
+    // 应用层发送缓冲区：send 发不出去的部分先放这里，等 EPOLLOUT 再继续发。
+    // output_offset 记录 output_buffer 里已经 send 出去的字节数，
+    // 全部发完后统一 clear + 归零，避免反复 erase 头部造成 O(n²) 搬移。
+    std::string output_buffer;
+    std::size_t output_offset = 0;
     std::mutex io_mutex;       // 同一连接的 recv/process/send 串行化
     std::atomic<bool> closed;  // 是否已关闭，防止重复清理
 };
@@ -709,6 +678,33 @@ public:
                     continue;  // 可能是刚关闭的连接留下的旧事件
                 }
 
+                // EPOLLOUT（且无 EPOLLIN）：内核发送缓冲区可写，把输出队列
+                // 里之前没发完的字节继续发出去。worker 只做非阻塞 send，
+                // 不会阻塞，发完或再次 EAGAIN 就返回。
+                if ((event_mask & EPOLLOUT) != 0 &&
+                    (event_mask &
+                     (EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP)) == 0) {
+                    const bool accepted =
+                        pool_.enqueue([this, connection] {
+                            try {
+                                flush_connection(connection);
+                            } catch (const std::exception& exception) {
+                                log_error(
+                                    "[worker] flush_connection 异常：" +
+                                    std::string(exception.what()));
+                                close_connection(connection);
+                            } catch (...) {
+                                log_error("[worker] flush_connection 未知异常");
+                                close_connection(connection);
+                            }
+                        });
+
+                    if (!accepted) {
+                        close_connection(connection);
+                    }
+                    continue;
+                }
+
                 // EPOLLIN      : 有新数据
                 // EPOLLRDHUP   : 对端半关闭，还要把缓冲区剩余消息处理完
                 // EPOLLERR/HUP : 连接异常，也交给 worker 走统一的读取/清理流程
@@ -1098,7 +1094,10 @@ private:
         // 否则 pretty-print 的换行会破坏“一行一个消息”的边界。
         const std::string wire = response.dump() + "\n";
 
-        if (!send_all_nonblocking(connection->fd, wire)) {
+        // 先排队再立即尝试发送，保证多条响应（流水线）的顺序不被破坏。
+        connection->output_buffer += wire;
+
+        if (!flush_output(connection)) {
             if (g_verbose) {
                 log_line("[send] 发送失败，关闭连接 fd=" +
                          std::to_string(connection->fd));
@@ -1106,7 +1105,58 @@ private:
             close_connection(connection);
             return false;
         }
+        // 发不出去的部分留在 output_buffer，由 rearm 注册 EPOLLOUT 后继续。
         return true;
+    }
+
+    // output_buffer 里是否还有没发完的字节。
+    bool has_pending_output(const std::shared_ptr<Connection>& connection) {
+        return connection->output_offset < connection->output_buffer.size();
+    }
+
+    // 尽力把 output_buffer 里没发完的字节继续 send 出去（非阻塞）。
+    // 调用方必须已经持有 connection->io_mutex。
+    // 返回 false 表示遇到 EPIPE/ECONNRESET 等硬错误，应关闭连接。
+    bool flush_output(const std::shared_ptr<Connection>& connection) {
+        while (connection->output_offset < connection->output_buffer.size()) {
+            const ssize_t n =
+                ::send(connection->fd,
+                       connection->output_buffer.data() + connection->output_offset,
+                       connection->output_buffer.size() - connection->output_offset,
+                       0);
+
+            if (n > 0) {
+                connection->output_offset += static_cast<std::size_t>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true;  // 这次发不动，等 EPOLLOUT 再继续
+            }
+            return false;  // EPIPE / ECONNRESET 等硬错误
+        }
+
+        // 全部发完，释放内存。
+        connection->output_buffer.clear();
+        connection->output_offset = 0;
+        return true;
+    }
+
+    // EPOLLOUT 事件的处理入口：把输出队列里剩余的数据继续发完，
+    // 然后根据是否还有剩余决定继续监听可写，还是回到只监听可读。
+    void flush_connection(const std::shared_ptr<Connection>& connection) {
+        std::unique_lock<std::mutex> io_lock(connection->io_mutex);
+        if (connection->closed.load()) {
+            return;
+        }
+
+        if (!flush_output(connection)) {
+            close_connection(connection);
+            return;
+        }
+        rearm(connection);
     }
 
     // EPOLLONESHOT 的 fd 处理完后必须重新注册，否则再也收不到事件。
@@ -1120,6 +1170,10 @@ private:
         epoll_event event;
         std::memset(&event, 0, sizeof(event));
         event.events = kClientEvents;
+        if (has_pending_output(connection)) {
+            // 还有没发完的字节：额外监听可写，等 EPOLLOUT 继续 flush。
+            event.events |= EPOLLOUT;
+        }
         event.data.u64 = connection->id;
 
         if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, connection->fd, &event) < 0) {
